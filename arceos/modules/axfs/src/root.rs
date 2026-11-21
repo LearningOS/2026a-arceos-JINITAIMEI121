@@ -70,12 +70,60 @@ impl RootDirectory {
         self.mounts.iter().any(|mp| mp.path == path)
     }
 
+    fn rename_from(&self, current_dir: &str, old: &str, new: &str) -> AxResult {
+        if old.is_empty() || new.is_empty() {
+            return ax_err!(NotFound);
+        }
+        let absolute = |path: &str| {
+            if path.starts_with('/') {
+                String::from(path)
+            } else {
+                String::from(current_dir) + path
+            }
+        };
+        self.rename(&absolute(old), &absolute(new))
+    }
+
+    fn rename_path(&self, path: &str) -> AxResult<String> {
+        if path.is_empty() {
+            return ax_err!(NotFound);
+        }
+        let trimmed = path.trim_end_matches('/');
+        let (parent, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+        if matches!(name, "." | "..") {
+            return ax_err!(InvalidInput);
+        }
+        let mut resolved = String::new();
+        for component in parent.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => resolved.truncate(resolved.rfind('/').unwrap_or(0)),
+                _ => {
+                    resolved.push('/');
+                    resolved.push_str(component);
+                    // Validate each directory before allowing a later '..' to cancel it.
+                    let node =
+                        self.lookup_mounted_fs(&resolved, |fs, rest| fs.root_dir().lookup(rest))?;
+                    if !node.get_attr()?.is_dir() {
+                        return ax_err!(NotADirectory);
+                    }
+                }
+            }
+        }
+        resolved.push('/');
+        resolved.push_str(name);
+        if path.ends_with('/') && !name.is_empty() {
+            resolved.push('/');
+        }
+        Ok(resolved)
+    }
+
     fn lookup_mounted_fs<F, T>(&self, path: &str, f: F) -> AxResult<T>
     where
         F: FnOnce(Arc<dyn VfsOps>, &str) -> AxResult<T>,
     {
         debug!("lookup at root: {}", path);
-        let path = path.trim_matches('/');
+        let path = path.trim_start_matches('/');
         if let Some(rest) = path.strip_prefix("./") {
             return self.lookup_mounted_fs(rest, f);
         }
@@ -86,17 +134,21 @@ impl RootDirectory {
         // Find the filesystem that has the longest mounted path match
         // TODO: more efficient, e.g. trie
         for (i, mp) in self.mounts.iter().enumerate() {
-            // skip the first '/'
-            if path.starts_with(&mp.path[1..]) && mp.path.len() - 1 > max_len {
-                max_len = mp.path.len() - 1;
-                idx = i;
+            if let Some(rest) = path.strip_prefix(&mp.path[1..]) {
+                if (rest.is_empty() || rest.starts_with('/')) && mp.path.len() - 1 > max_len {
+                    max_len = mp.path.len() - 1;
+                    idx = i;
+                }
             }
         }
 
         if max_len == 0 {
             f(self.main_fs.clone(), path) // not matched any mount point
         } else {
-            f(self.mounts[idx].fs.clone(), &path[max_len..]) // matched at `idx`
+            f(
+                self.mounts[idx].fs.clone(),
+                path[max_len..].trim_start_matches('/'),
+            )
         }
     }
 }
@@ -133,12 +185,18 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
-            }
+        let src_path = self.rename_path(src_path)?;
+        let dst_path = self.rename_path(dst_path)?;
+        self.lookup_mounted_fs(&src_path, |src_fs, src_rest| {
+            self.lookup_mounted_fs(&dst_path, |dst_fs, dst_rest| {
+                if src_rest.is_empty() || dst_rest.is_empty() {
+                    ax_err!(PermissionDenied) // cannot rename mount points
+                } else if !Arc::ptr_eq(&src_fs, &dst_fs) {
+                    ax_err!(Unsupported)
+                } else {
+                    src_fs.root_dir().rename(src_rest, dst_rest)
+                }
+            })
         })
     }
 }
@@ -302,9 +360,111 @@ pub(crate) fn set_current_dir(path: &str) -> AxResult {
 }
 
 pub(crate) fn rename(old: &str, new: &str) -> AxResult {
-    if parent_node_of(None, new).lookup(new).is_ok() {
-        warn!("dst file already exist, now remove it");
-        remove_file(None, new)?;
+    let current_dir = CURRENT_DIR_PATH.lock().clone();
+    ROOT_DIR.rename_from(&current_dir, old, new)
+}
+
+#[cfg(all(test, feature = "ramfs"))]
+mod tests {
+    use super::*;
+    use axfs_ramfs::RamFileSystem;
+
+    #[test]
+    fn rename_routes_both_paths_from_one_root() -> AxResult {
+        let main = Arc::new(RamFileSystem::new());
+        let tmp = Arc::new(RamFileSystem::new());
+        let data = Arc::new(RamFileSystem::new());
+        let mut root = RootDirectory::new(main.clone());
+        root.mount("/tmp", tmp.clone())?;
+        root.mount("/data", data.clone())?;
+        tmp.root_dir().create("f", VfsNodeType::File)?;
+        tmp.root_dir().create("sub", VfsNodeType::Dir)?;
+        let file = tmp.root_dir().lookup("f")?;
+        for (cwd, src, dst, local) in [
+            ("/", "/tmp/f", "/tmp/g", "g"),
+            ("/tmp/", "g", "/tmp/f", "f"),
+            ("/tmp/", "/tmp/f", "g", "g"),
+            ("/tmp/sub/", "../g", "/./tmp/sub/../f", "f"),
+            ("/tmp/", "../tmp/f", "./f", "f"),
+        ] {
+            root.rename_from(cwd, src, dst)?;
+            assert!(Arc::ptr_eq(&file, &tmp.root_dir().lookup(local)?));
+        }
+        tmp.root_dir().create("target", VfsNodeType::File)?;
+        let target = tmp.root_dir().lookup("target")?;
+        target.write_at(0, b"old")?;
+        root.rename_from("/tmp/", "f", "target")?;
+        assert!(Arc::ptr_eq(&file, &tmp.root_dir().lookup("target")?));
+        assert_eq!(tmp.root_dir().lookup("f").err(), Some(AxError::NotFound));
+        let mut buf = [0; 3];
+        target.read_at(0, &mut buf)?;
+        assert_eq!(&buf, b"old");
+
+        main.root_dir().create("tmp-other", VfsNodeType::Dir)?;
+        for (dir, prefix) in [
+            (main.root_dir().lookup("tmp-other")?, "/tmp-other/"),
+            (data.root_dir(), "/data/"),
+        ] {
+            dir.create("f", VfsNodeType::File)?;
+            let file = dir.clone().lookup("f")?;
+            root.rename_from(prefix, "f", "g")?;
+            assert!(Arc::ptr_eq(&file, &dir.lookup("g")?));
+        }
+        Ok(())
     }
-    parent_node_of(None, old).rename(old, new)
+
+    #[test]
+    fn rename_route_errors_leave_entries_intact() -> AxResult {
+        let main = Arc::new(RamFileSystem::new());
+        let tmp = Arc::new(RamFileSystem::new());
+        let data = Arc::new(RamFileSystem::new());
+        let mut root = RootDirectory::new(main.clone());
+        root.mount("/tmp", tmp.clone())?;
+        root.mount("/data", data.clone())?;
+        tmp.root_dir().create("f", VfsNodeType::File)?;
+        tmp.root_dir().create("target", VfsNodeType::File)?;
+        tmp.root_dir().create("empty", VfsNodeType::Dir)?;
+        tmp.root_dir().create("full", VfsNodeType::Dir)?;
+        tmp.root_dir().create("full/child", VfsNodeType::File)?;
+        data.root_dir().create("f", VfsNodeType::File)?;
+        main.root_dir().create("f", VfsNodeType::File)?;
+        let paths = ["f", "target", "empty", "full", "full/child"];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|p| tmp.root_dir().lookup(p).unwrap())
+            .collect();
+        let other = data.root_dir().lookup("f")?;
+        let main_file = main.root_dir().lookup("f")?;
+        for (src, dst, error) in [
+            ("missing", "target", AxError::NotFound),
+            ("f/", "target", AxError::NotADirectory),
+            ("f", "target/", AxError::NotADirectory),
+            ("f/../f", "target", AxError::NotADirectory),
+            ("f", "f/../target", AxError::NotADirectory),
+            ("f", "full/.", AxError::InvalidInput),
+            ("full/..", "target", AxError::InvalidInput),
+            ("empty/", "full/", AxError::DirectoryNotEmpty),
+            ("f", "/data/f", AxError::Unsupported),
+            ("/data/f", "target", AxError::Unsupported),
+            ("f", "../f", AxError::Unsupported),
+            ("/tmp/", "target", AxError::PermissionDenied),
+            ("f", "/tmp///", AxError::PermissionDenied),
+            ("/", "target", AxError::PermissionDenied),
+            ("f", "/", AxError::PermissionDenied),
+            ("", "target", AxError::NotFound),
+            ("f", "", AxError::NotFound),
+        ] {
+            assert_eq!(
+                root.rename_from("/tmp/", src, dst),
+                Err(error),
+                "{src} -> {dst}"
+            );
+            for (path, node) in paths.iter().zip(&before) {
+                assert!(Arc::ptr_eq(node, &tmp.root_dir().lookup(path)?));
+            }
+            assert!(Arc::ptr_eq(&other, &data.root_dir().lookup("f")?));
+            assert!(Arc::ptr_eq(&main_file, &main.root_dir().lookup("f")?));
+        }
+        Ok(())
+    }
 }

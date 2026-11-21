@@ -8,6 +8,8 @@ use axtask::current;
 use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
+use alloc::vec::Vec;
+use memory_addr::{VirtAddr, VirtAddrRange, PAGE_SIZE_4K};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -83,7 +85,7 @@ bitflags::bitflags! {
     struct MmapFlags: i32 {
         /// Share changes
         const MAP_SHARED = 1 << 0;
-        /// Changes private; copy pages on write.
+        /// Changes private; implemented here by an eager copy, not copy-on-write.
         const MAP_PRIVATE = 1 << 1;
         /// Map address must be exactly as requested, no matter whether it is available.
         const MAP_FIXED = 1 << 4;
@@ -131,16 +133,133 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
+// MAP_FIXED only accepts vacant ranges because AddrSpace::unmap retains area metadata.
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    syscall_body!(sys_mmap, {
+        let prot = MmapProt::from_bits(prot).ok_or(LinuxError::EINVAL)?;
+        let flags = MmapFlags::from_bits(flags).ok_or(LinuxError::EINVAL)?;
+        let page_mask = PAGE_SIZE_4K - 1;
+        if length == 0 || offset < 0 || (offset as usize & page_mask) != 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        let size = length
+            .checked_add(page_mask)
+            .ok_or(LinuxError::ENOMEM)?
+            & !page_mask;
+        let private = flags.contains(MmapFlags::MAP_PRIVATE);
+        let shared = flags.contains(MmapFlags::MAP_SHARED);
+        if private == shared {
+            return Err(LinuxError::EINVAL);
+        }
+        if shared || flags.intersects(MmapFlags::MAP_NORESERVE | MmapFlags::MAP_STACK) {
+            return Err(LinuxError::EOPNOTSUPP);
+        }
+        // A RISC-V leaf requires R or X; W without R is reserved.
+        if prot.is_empty()
+            || (prot.contains(MmapProt::PROT_WRITE) && !prot.contains(MmapProt::PROT_READ))
+        {
+            return Err(LinuxError::EOPNOTSUPP);
+        }
+        let anonymous = flags.contains(MmapFlags::MAP_ANONYMOUS);
+        if anonymous {
+            // The descriptor is ignored for anonymous mappings.
+            if offset != 0 {
+                return Err(LinuxError::EINVAL);
+            }
+        } else {
+            (offset as usize)
+                .checked_add(size)
+                .filter(|end| *end <= isize::MAX as usize)
+                .ok_or(LinuxError::EOVERFLOW)?;
+        }
+
+        let fixed = flags.contains(MmapFlags::MAP_FIXED);
+        let requested = addr as usize; // Treat the user pointer only as an address.
+        if fixed && requested & page_mask != 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        let curr = current();
+        let mut aspace = curr.task_ext().aspace.lock();
+        // Exclude page zero and addresses that would look like negative errno.
+        let lower = aspace
+            .base()
+            .as_usize()
+            .max(PAGE_SIZE_4K)
+            .checked_add(page_mask)
+            .ok_or(LinuxError::ENOMEM)?
+            & !page_mask;
+        let upper = aspace.end().as_usize().min(isize::MAX as usize) & !page_mask;
+        if size > upper.checked_sub(lower).ok_or(LinuxError::ENOMEM)? {
+            return Err(LinuxError::ENOMEM);
+        }
+        let hint = requested & !page_mask;
+        let valid_hint = hint >= lower && hint.checked_add(size).is_some_and(|end| end <= upper);
+        if fixed && !valid_hint {
+            return Err(LinuxError::ENOMEM);
+        }
+        // A restricted search tests the exact hint without replacing any area.
+        let at_hint = if valid_hint {
+            aspace
+                .find_free_area(
+                    VirtAddr::from(hint),
+                    size,
+                    VirtAddrRange::from_start_size(VirtAddr::from(hint), size),
+                )
+                .filter(|start| start.as_usize() == hint)
+        } else {
+            None
+        };
+        let start = if fixed {
+            at_hint.ok_or(LinuxError::EOPNOTSUPP)?
+        } else {
+            // Unavailable, NULL or out-of-range hints fall back to a user gap.
+            at_hint
+                .or_else(|| {
+                    aspace.find_free_area(
+                        VirtAddr::from(lower),
+                        size,
+                        VirtAddrRange::from_start_size(VirtAddr::from(lower), upper - lower),
+                    )
+                })
+                .ok_or(LinuxError::ENOMEM)?
+        };
+
+        // Finish file I/O before adding an area that cannot be rolled back.
+        let mut data = Vec::new();
+        if !anonymous {
+            data.try_reserve_exact(size)
+                .map_err(|_| LinuxError::ENOMEM)?;
+            data.resize(size, 0);
+            api::read_file_at(fd, &mut data, offset as u64)?;
+        }
+        aspace
+            .map_alloc(start, size, prot.into(), true)
+            .map_err(|_| LinuxError::ENOMEM)?;
+        // The populated backend can report success after skipping a failed frame allocation.
+        for off in (0..size).step_by(PAGE_SIZE_4K) {
+            aspace
+                .page_table()
+                .query(start + off)
+                .map_err(|_| LinuxError::ENOMEM)?;
+        }
+        if !data.is_empty() {
+            // The kernel initializes read-only user pages through its physical mapping.
+            aspace.write(start, &data)?;
+        }
+        axhal::arch::flush_tlb(None);
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!("fence.i", options(nostack));
+        }
+        Ok(start.as_usize())
+    })
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

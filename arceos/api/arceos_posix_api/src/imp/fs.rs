@@ -75,6 +75,31 @@ impl FileLike for File {
     }
 }
 
+/// Reads from one pinned file without changing its cursor.
+pub fn read_file_at(fd: c_int, buf: &mut [u8], offset: u64) -> LinuxResult<usize> {
+    offset
+        .checked_add(buf.len() as u64)
+        .ok_or(LinuxError::EOVERFLOW)?;
+    let file = File::from_fd(fd)?;
+    let inner = file.inner.lock();
+    if !inner.get_attr()?.is_file() {
+        return Err(LinuxError::ENODEV);
+    }
+
+    let mut total = 0;
+    while total < buf.len() {
+        let n = inner.read_at(offset + total as u64, &mut buf[total..])?;
+        if n == 0 {
+            break;
+        }
+        if n > buf.len() - total {
+            return Err(LinuxError::EIO);
+        }
+        total += n;
+    }
+    Ok(total)
+}
+
 /// Convert open flags to [`OpenOptions`].
 fn flags_to_options(flags: c_int, _mode: ctypes::mode_t) -> OpenOptions {
     let flags = flags as u32;

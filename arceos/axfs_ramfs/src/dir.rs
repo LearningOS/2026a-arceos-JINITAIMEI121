@@ -67,6 +67,24 @@ impl DirNode {
         children.remove(name);
         Ok(())
     }
+
+    fn rename_parent<'a>(&self, path: &'a str) -> VfsResult<(VfsNodeRef, &'a str)> {
+        let path = path.trim_end_matches('/');
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if matches!(name, "" | "." | "..") {
+            return Err(VfsError::InvalidInput);
+        }
+        // Resolve the parent node so aliases work but file/.. still fails.
+        let parent = self
+            .this
+            .upgrade()
+            .ok_or(VfsError::NotFound)?
+            .lookup(parent)?;
+        if !parent.get_attr()?.is_dir() {
+            return Err(VfsError::NotADirectory);
+        }
+        Ok((parent, name))
+    }
 }
 
 impl VfsNodeOps for DirNode {
@@ -163,6 +181,45 @@ impl VfsNodeOps for DirNode {
         } else {
             self.remove_node(name)
         }
+    }
+
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        let (src_parent, src_name) = self.rename_parent(src_path)?;
+        let (dst_parent, dst_name) = self.rename_parent(dst_path)?;
+        if !Arc::ptr_eq(&src_parent, &dst_parent) {
+            return Err(VfsError::Unsupported); // same-directory rename only
+        }
+        let parent = src_parent
+            .as_any()
+            .downcast_ref::<Self>()
+            .ok_or(VfsError::Unsupported)?;
+        let mut children = parent.children.write();
+        let source = children.get(src_name).ok_or(VfsError::NotFound)?;
+        let source_is_dir = source.get_attr()?.is_dir();
+        if (src_path.ends_with('/') || dst_path.ends_with('/')) && !source_is_dir {
+            return Err(VfsError::NotADirectory);
+        }
+        if src_name == dst_name {
+            return Ok(()); // a no-op, but only if the source exists
+        }
+        if let Some(target) = children.get(dst_name) {
+            let target_is_dir = target.get_attr()?.is_dir();
+            match (source_is_dir, target_is_dir) {
+                (false, true) => return Err(VfsError::IsADirectory),
+                (true, false) => return Err(VfsError::NotADirectory),
+                _ => {}
+            }
+            if let Some(dir) = target.as_any().downcast_ref::<Self>() {
+                if !dir.children.read().is_empty() {
+                    return Err(VfsError::DirectoryNotEmpty);
+                }
+            }
+        }
+        // Move the same Arc under one parent lock after all fallible checks.
+        let dst_name = String::from(dst_name);
+        let source = children.remove(src_name).unwrap();
+        children.insert(dst_name, source);
+        Ok(())
     }
 
     axfs_vfs::impl_vfs_dir_default! {}

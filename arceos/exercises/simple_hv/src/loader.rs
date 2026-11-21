@@ -6,7 +6,7 @@ use axmm::AddrSpace;
 use crate::VM_ENTRY;
 
 pub fn load_vm_image(fname: &str, uspace: &mut AddrSpace) -> io::Result<()> {
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; PAGE_SIZE_4K];
     load_file(fname, &mut buf)?;
 
     uspace.map_alloc(VM_ENTRY.into(), PAGE_SIZE_4K, MappingFlags::READ|MappingFlags::WRITE|MappingFlags::EXECUTE|MappingFlags::USER, true).unwrap();
